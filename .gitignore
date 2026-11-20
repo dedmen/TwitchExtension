@@ -1,0 +1,6 @@
+bin/
+obj/
+.vs/
+*.user
+ebs/track.json
+desktop/settings.json
