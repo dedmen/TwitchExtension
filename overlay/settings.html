@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Now Playing — Settings</title>
+  <!-- Twitch Extension Helper: required on every extension HTML file (see AGENTS.md).
+       This page is the extension's Configuration Path — it renders in Twitch's
+       settings UI (NOT over the video), so a normal dark background is fine.
+       All JS lives in settings.js — Twitch's CSP has no 'unsafe-inline'. -->
+  <script src="https://extension-files.twitch.tv/helper/v1/twitch-ext.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #0a0a0e;
+      color: #fff;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px;
+    }
+    .card { max-width: 420px; }
+    h1 { font-size: 16px; margin: 0 0 6px; }
+    .hint { margin: 0 0 18px; color: rgba(255, 255, 255, 0.6); font-size: 12px; line-height: 1.5; }
+    .hint code {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 11px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 4px;
+      padding: 1px 4px;
+    }
+    label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: rgba(255, 255, 255, 0.72);
+      margin-bottom: 6px;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      background: rgba(255, 255, 255, 0.06);
+      color: #fff;
+      font-size: 14px;
+      font-family: ui-monospace, Consolas, monospace;
+    }
+    input[type="text"]:focus { outline: none; border-color: #9147ff; }
+    .error {
+      display: block;
+      margin-top: 6px;
+      color: #f07167;
+      font-size: 12px;
+    }
+    .error[hidden] { display: none !important; }
+    .row { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+    button {
+      padding: 8px 18px;
+      border: 0;
+      border-radius: 8px;
+      background: #9147ff;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: #a35cff; }
+    button:disabled { opacity: 0.55; cursor: default; }
+    .saved { color: #7bc47f; font-size: 12px; }
+    .saved[hidden] { display: none !important; }
+    .note { margin-top: 16px; color: rgba(255, 255, 255, 0.4); font-size: 12px; }
+    .note[hidden] { display: none !important; }
+    .status { margin-top: 12px; color: rgba(255, 255, 255, 0.5); font-size: 11px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Now Playing</h1>
+    <p class="hint">
+      Enter your <strong>tenant ID</strong> — the same value from the desktop app's
+      <code>settings.json</code> (<code>tenantId</code>). The overlay shows that
+      streamer's track only; the ID must match exactly.
+      3&ndash;64 characters: letters, numbers, <code>_</code>, <code>-</code>.
+    </p>
+    <label for="tenantId">Tenant ID</label>
+    <input type="text" id="tenantId" name="tenantId" autocomplete="off" spellcheck="false"
+           maxlength="64" placeholder="e.g. dedmen" />
+    <div class="error" id="error" hidden></div>
+    <div class="row">
+      <button id="save" type="button">Save</button>
+      <span class="saved" id="saved" hidden>Saved</span>
+    </div>
+    <p class="note" id="plainNote" hidden>
+      Opened outside Twitch — the form validates, but saving only works inside the extension.
+    </p>
+    <p class="status" id="status"></p>
+  </div>
+
+  <script src="settings.js"></script>
+</body>
+</html>

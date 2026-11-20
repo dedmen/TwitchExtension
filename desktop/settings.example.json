@@ -1,0 +1,7 @@
+{
+  "ebsUrl": "http://127.0.0.1:5080",
+  "pushKey": "dev-push-key-change-me",
+  "tenantId": "local",
+  "skipButtonEnabled": true,
+  "preferredSource": "sendspin"
+}

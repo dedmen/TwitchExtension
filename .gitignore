@@ -4,3 +4,5 @@ obj/
 *.user
 ebs/track.json
 desktop/settings.json
+
+overlay/overlay.zip
