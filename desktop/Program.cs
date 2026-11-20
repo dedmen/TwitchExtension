@@ -3,6 +3,33 @@ using System.Windows.Forms;
 
 namespace TwitchExtension.Desktop;
 
+/// <summary>
+/// Append-only log next to <c>settings.json</c> (plan.md, Logging): a <c>WinExe</c> has no
+/// console, so <c>Console.WriteLine</c> goes nowhere in production. Log failures are
+/// swallowed — logging must never take the app down.
+/// </summary>
+internal static class AppLog
+{
+    private static readonly object Gate = new();
+    private static readonly string LogPath = System.IO.Path.Combine(AppContext.BaseDirectory, "desktop.log");
+
+    public static void Write(string message)
+    {
+        try
+        {
+            lock (Gate)
+            {
+                File.AppendAllText(LogPath,
+                    $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}");
+            }
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+}
+
 internal static class Program
 {
     private const string SingleInstanceMutexName = @"Local\TwitchExtension.Desktop.SingleInstance";
@@ -19,19 +46,41 @@ internal static class Program
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
+        // Last-resort crash diagnostics (plan.md, Logging): a WinExe crash would be
+        // invisible otherwise. Every unhandled path is logged, never re-thrown.
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            AppLog.Write($"[fatal] unhandled exception: {e.ExceptionObject}");
+        TaskScheduler.UnobservedTaskException += (_, e) =>
+        {
+            e.SetObserved();
+            AppLog.Write($"[fatal] unobserved task exception: {e.Exception}");
+        };
+        Application.ThreadException += (_, e) =>
+            AppLog.Write($"[fatal] UI thread exception: {e.Exception}");
+
         // Route async continuations on this thread through the WinForms message loop.
         SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
 
+        // Config problems must never crash Main (plan.md, Settings): Load() normalizes,
+        // the validity checks never throw, and the EbsClient constructor tolerates a
+        // malformed ebsUrl (tray-only mode + tooltip).
         var config = AppConfig.Load();
         var client = new EbsClient(config);
-        var app = new TrayApp(config, client, config.HasValidTenantId);
+        var hasTenant = config.HasValidTenantId;
+        var hasEbsUrl = config.HasValidEbsUrl;
+        var app = new TrayApp(config, client, hasTenant, hasEbsUrl);
 
-        // No valid tenantId → tray only: no EBS connection, no retry loop.
-        if (config.HasValidTenantId)
+        // No valid tenantId → tray only: no EBS connection, no retry loop, no SMTC
+        // monitor (plan.md, Pushing: with nowhere to push, all its COM work would be
+        // discarded by the client's guard). No valid ebsUrl → tray only, no WS attempt.
+        if (hasTenant && hasEbsUrl)
         {
             client.Start();
         }
-        StartMonitorAsync(app, config);
+        if (hasTenant)
+        {
+            StartMonitorAsync(app, config);
+        }
 
         // Runs hidden — no main window; the loop lives until Exit is chosen.
         Application.Run();
@@ -49,7 +98,9 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[smtc] Could not start SMTC monitoring: {ex.GetBaseException().Message}");
+            // A WinExe has no console — a startup failure must be visible in the tray.
+            AppLog.Write($"[smtc] Could not start SMTC monitoring: {ex.GetBaseException().Message}");
+            app.ReportFatal("SMTC could not start");
         }
     }
 }
@@ -67,14 +118,18 @@ internal sealed class TrayApp
     private SmtcMonitor? _monitor;
     private Track? _track;
     private bool _ebsFailing;
+    private bool _disposed;
     private readonly bool _noTenant;
+    private readonly bool _badEbsUrl;
+    private string? _fatalMessage;
 
-    public TrayApp(AppConfig config, EbsClient client, bool hasValidTenantId)
+    public TrayApp(AppConfig config, EbsClient client, bool hasValidTenantId, bool hasValidEbsUrl)
     {
         _config = config;
         _client = client;
         _ui = SynchronizationContext.Current!;
         _noTenant = !hasValidTenantId;
+        _badEbsUrl = !hasValidEbsUrl;
 
         var menu = new ContextMenuStrip();
         menu.Items.Add("Open EBS", null, (_, _) => OpenEbs());
@@ -90,7 +145,11 @@ internal sealed class TrayApp
         _icon = new NotifyIcon
         {
             Icon = SystemIcons.Application,
-            Text = _noTenant ? "No tenantId — set it in settings.json" : "No media",
+            Text = _noTenant
+                ? "No tenantId — set it in settings.json"
+                : _badEbsUrl
+                    ? "Bad ebsUrl in settings.json"
+                    : "No media",
             ContextMenuStrip = menu,
             Visible = true,
         };
@@ -103,6 +162,12 @@ internal sealed class TrayApp
             if (monitor is not null) _ = monitor.SkipAsync();
         };
     }
+
+    /// <summary>
+    /// Surfaces a fatal startup error (e.g. SMTC could not start) in the tray tooltip —
+    /// a WinExe has no console, so the log file alone would stay invisible.
+    /// </summary>
+    public void ReportFatal(string message) => BeginUi(() => { _fatalMessage = message; UpdateTooltip(); });
 
     /// <summary>Tray toggle: persist the setting and push the current snapshot immediately.</summary>
     private void OnSkipToggle(bool enabled)
@@ -146,6 +211,18 @@ internal sealed class TrayApp
             return;
         }
 
+        if (_badEbsUrl)
+        {
+            _icon.Text = "Bad ebsUrl in settings.json";
+            return;
+        }
+
+        if (_fatalMessage is not null)
+        {
+            _icon.Text = _fatalMessage;
+            return;
+        }
+
         if (_ebsFailing)
         {
             _icon.Text = "EBS unreachable";
@@ -183,7 +260,7 @@ internal sealed class TrayApp
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[ui] Could not open {_config.EbsUrl}: {ex.Message}");
+            AppLog.Write($"[ui] Could not open {_config.EbsUrl}: {ex.GetBaseException().Message}");
         }
     }
 
@@ -194,11 +271,15 @@ internal sealed class TrayApp
     }
 
     /// <summary>
-    /// Tidy shutdown (idempotent). A live NotifyIcon keeps the process alive, so it is
-    /// hidden and disposed before the message loop exits.
+    /// Tidy shutdown, idempotent (plan.md, Tray UI): the menu Exit item and the loop
+    /// teardown can both reach it — a double Dispose while a fire-and-forget send is in
+    /// flight would throw from an unobserved task.
     /// </summary>
     public void Shutdown()
     {
+        if (_disposed) return;
+        _disposed = true;
+
         if (_icon is not null)
         {
             _icon.Visible = false;
@@ -207,5 +288,6 @@ internal sealed class TrayApp
         }
         _monitor?.Dispose();
         _client.Dispose();
+        AppLog.Write("[app] clean exit");
     }
 }

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.StaticFiles;
@@ -10,31 +11,119 @@ using TwitchExtension.Ebs;
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-app.UseWebSockets();
+// Keep-alive: the server sends a WS PING every 60 s (KeepAliveInterval);
+// browsers auto-pong, and a connection that does not PONG within the same
+// interval is aborted (KeepAliveTimeout) — half-open sockets are detected
+// instead of lingering until TCP gives up. (Ebs:KeepAliveSeconds overrides,
+// default 60 — mainly for testing.) Note: KeepAliveTimeout alone only sets
+// the PONG wait and sends no pings; the interval is what drives them.
+var keepAliveSeconds = builder.Configuration.GetValue("Ebs:KeepAliveSeconds", 60);
+var keepAlive = TimeSpan.FromSeconds(Math.Max(1, keepAliveSeconds));
+app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = keepAlive, KeepAliveTimeout = keepAlive });
 
 var contentRoot = builder.Environment.ContentRootPath;
 var pushKey = builder.Configuration["Ebs:PushKey"] ?? "dev-push-key-change-me";
 var streamDelayMs = builder.Configuration.GetValue("Ebs:StreamDelayMs", 10000L);
 var pruneIntervalMs = builder.Configuration.GetValue("Ebs:PruneIntervalMs", 600000L);
+var pruneStaleAfterMs = builder.Configuration.GetValue("Ebs:PruneStaleAfterMs", 3600000L);
+var maxTenants = builder.Configuration.GetValue("Ebs:MaxTenants", 1000);
+
+const string OkJson = "{\"ok\":true}";
+const string BadRequestJson = "{\"error\":\"bad-request\"}";
+const string TenantLimitJson = "{\"error\":\"tenant-limit\"}";
+const string NextCmdJson = "{\"type\":\"next\"}";
+const string BadTenantJson = "{\"error\":\"bad-tenant\"}";
+
+const int MaxInboundMessageBytes = 2 * 1024 * 1024; // inbound text message cap
+const int MaxArtChars = 700 * 1024;                 // art string cap (512 KB cap + base64 overhead)
+const int SendTimeoutMs = 2000;                     // per-send fan-out timeout
+const int SkipRelayCooldownMs = 1000;               // per-tenant skip-relay cooldown
+
+var jsonOptions = new JsonSerializerOptions();
 
 // --- Per-tenant state (in-memory only, not persisted) ----------------------
 // One tenant = one streamer (extension instance + desktop app). Track store,
 // overlay clients and desktop clients are partitioned per tenant; nothing
 // crosses tenants.
+//
+// Tenants are created ONLY by an accepted desktop-channel push. The read
+// paths (GET, overlay WS) never create a tenant — they serve the idle track
+// from a throwaway object. Overlay clients that connect to a tenant with no
+// store entry yet wait in pendingOverlay and are merged into the tenant when
+// its first push creates it. tenantLock serializes creation, attach and the
+// prune sweep so pruning can never orphan a connecting client, and bounds
+// the store at Ebs:MaxTenants (429 for a new tenant at the cap).
 
 var tenants = new ConcurrentDictionary<string, Tenant>();
+var pendingOverlay = new ConcurrentDictionary<string, ConcurrentDictionary<Guid, WsClient>>();
+var tenantLock = new object();
 var tenantIdPattern = new Regex("^[A-Za-z0-9_-]{3,64}$", RegexOptions.Compiled);
-
-Tenant GetTenant(string id) => tenants.GetOrAdd(id, _ => new Tenant());
 
 bool ValidTenant(string id) => tenantIdPattern.IsMatch(id);
 
-var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = null };
+/// <summary>Overlay connect: register on the tenant, or in the pending set if it has no store entry.</summary>
+void TryAttachOverlay(string id, Guid clientId, WsClient client, out Tenant? t)
+{
+    lock (tenantLock)
+    {
+        if (tenants.TryGetValue(id, out var existing))
+        {
+            existing.Overlay[clientId] = client;
+            t = existing;
+            return;
+        }
+        pendingOverlay.GetOrAdd(id, _ => new())[clientId] = client;
+        t = null;
+    }
+}
 
-const string OkJson = "{\"ok\":true}";
-const string BadRequestJson = "{\"error\":\"bad-request\"}";
-const string NextCmdJson = "{\"type\":\"next\"}";
-const string BadTenantJson = "{\"error\":\"bad-tenant\"}";
+void DetachOverlay(string id, Guid clientId)
+{
+    lock (tenantLock)
+    {
+        if (tenants.TryGetValue(id, out var t))
+        {
+            t.Overlay.TryRemove(clientId, out _);
+            return;
+        }
+        if (pendingOverlay.TryGetValue(id, out var p))
+        {
+            p.TryRemove(clientId, out _);
+            if (p.IsEmpty) pendingOverlay.TryRemove(id, out _);
+        }
+    }
+}
+
+/// <summary>Desktop connect: register only when the tenant already exists (unknown tenants are not created).</summary>
+void AttachDesktopIfExists(string id, Guid clientId, WsClient client)
+{
+    lock (tenantLock)
+    {
+        if (tenants.TryGetValue(id, out var t))
+            t.Desktop[clientId] = client;
+    }
+}
+
+void DetachDesktop(string id, Guid clientId)
+{
+    lock (tenantLock)
+    {
+        if (tenants.TryGetValue(id, out var t))
+            t.Desktop.TryRemove(clientId, out _);
+    }
+}
+
+/// <summary>Create-or-get for a push. Caller holds tenantLock. Null = cap reached.</summary>
+Tenant? CreateOrGetTenantLocked(string id)
+{
+    if (tenants.TryGetValue(id, out var existing)) return existing;
+    if (tenants.Count >= maxTenants) return null;
+    var t = new Tenant();
+    tenants[id] = t;
+    if (pendingOverlay.TryRemove(id, out var waiting))
+        foreach (var kv in waiting) t.Overlay[kv.Key] = kv.Value;
+    return t;
+}
 
 /// <summary>Serialized track as served/broadcast: stream delay applied to positionMs.</summary>
 string ServedTrackJson(Tenant t)
@@ -84,6 +173,8 @@ Track? TrackFromElement(JsonElement root)
 {
     if (root.ValueKind != JsonValueKind.Object) return null;
 
+    // A string property: null when missing or not a string (callers reject null
+    // for the required ones).
     string? GetString(string name) =>
         root.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.String
             ? el.GetString()
@@ -101,12 +192,14 @@ Track? TrackFromElement(JsonElement root)
         if (artEl.ValueKind == JsonValueKind.Null) art = null;
         else if (artEl.ValueKind == JsonValueKind.String) art = artEl.GetString();
         else return null;
+        // Inbound limit: an oversized art string is a bad frame, not a track.
+        if (art is not null && art.Length > MaxArtChars) return null;
     }
 
     var state = GetString("state");
     if (state is null || !TrackState.All.Contains(state)) return null;
 
-    // Optional ints >= 0 (missing -> 0).
+    // Optional ints/longs >= 0 (missing -> 0; negative -> bad frame).
     long positionMs = 0;
     if (root.TryGetProperty("positionMs", out var pEl))
     {
@@ -167,13 +260,13 @@ Track? TrackFromElement(JsonElement root)
         if (nEl.ValueKind == JsonValueKind.Null) next = null;
         else if (nEl.ValueKind == JsonValueKind.Object)
         {
-            string? nTitle = nEl.TryGetProperty("title", out var nt) && nt.ValueKind == JsonValueKind.String
-                ? nt.GetString()
+            // Non-string / missing members fall back to "" (never null).
+            string nTitle = nEl.TryGetProperty("title", out var nt) && nt.ValueKind == JsonValueKind.String
+                ? nt.GetString()!
                 : "";
-            string? nArtist = nEl.TryGetProperty("artist", out var na) && na.ValueKind == JsonValueKind.String
-                ? na.GetString()
+            string nArtist = nEl.TryGetProperty("artist", out var na) && na.ValueKind == JsonValueKind.String
+                ? na.GetString()!
                 : "";
-            if (nTitle is null || nArtist is null) return null;
             next = new NextTrack { Title = nTitle, Artist = nArtist };
         }
         else return null;
@@ -199,17 +292,18 @@ Track? TrackFromElement(JsonElement root)
 }
 
 // --- WebSocket plumbing ----------------------------------------------------
-// Keep-alive is the built-in .NET ping frame (~15 s); browsers auto-pong.
+// Keep-alive is the .NET ping frame: the server PINGs every
+// KeepAliveInterval (Ebs:KeepAliveSeconds, default 60 s) and aborts a client
+// that misses the KeepAliveTimeout PONG window; browsers auto-pong. No
+// app-level heartbeat.
 
-async Task SendTextAsync(WebSocket ws, string json)
+/// <summary>
+/// Reads one full (possibly fragmented) text message; null when the client
+/// closes or the 2 MB message cap is exceeded (the connection is closed).
+/// </summary>
+async Task<string?> ReadFullTextMessageAsync(WsClient client)
 {
-    var bytes = System.Text.Encoding.UTF8.GetBytes(json);
-    await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, endOfMessage: true, default);
-}
-
-/// <summary>Reads one full (possibly fragmented) text message; null when the client closes.</summary>
-async Task<string?> ReadFullTextMessageAsync(WebSocket ws)
-{
+    var ws = client.Socket;
     var buffer = new byte[8 * 1024];
     using var ms = new MemoryStream();
     while (true)
@@ -218,75 +312,85 @@ async Task<string?> ReadFullTextMessageAsync(WebSocket ws)
         if (result.MessageType == WebSocketMessageType.Close)
             return null;
         if (result.MessageType is WebSocketMessageType.Text or WebSocketMessageType.Binary)
-            ms.Write(buffer, 0, result.Count);
-        if (result.EndOfMessage)
-            return System.Text.Encoding.UTF8.GetString(ms.ToArray());
-    }
-}
-
-async Task CloseQuietlyAsync(WebSocket ws)
-{
-    try
-    {
-        if (ws.State is WebSocketState.Open or WebSocketState.CloseReceived)
-            await ws.CloseOutputAsync(WebSocketCloseStatus.EndpointUnavailable, "send failed", default);
-    }
-    catch
-    {
-        // best effort
-    }
-}
-
-async Task CompleteCloseHandshakeAsync(WebSocket ws)
-{
-    try
-    {
-        if (ws.State == WebSocketState.CloseReceived)
-            await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, string.Empty, default);
-    }
-    catch
-    {
-        // best effort
-    }
-}
-
-/// <summary>Best-effort fan-out to one client set; a client whose send fails is dropped.</summary>
-async Task BroadcastAsync(ConcurrentDictionary<Guid, WebSocket> clients, string json)
-{
-    var bytes = System.Text.Encoding.UTF8.GetBytes(json);
-    foreach (var (id, ws) in clients)
-    {
-        if (ws.State != WebSocketState.Open)
         {
-            _ = clients.TryRemove(id, out _);
-            continue;
+            ms.Write(buffer, 0, result.Count);
+            // Inbound limit: the only legitimate inbound input is a small track
+            // frame / skip command; anything bigger is an attack.
+            if (ms.Length > MaxInboundMessageBytes)
+            {
+                await client.CloseAsync("message too big");
+                return null;
+            }
         }
+        if (result.EndOfMessage)
+            return Encoding.UTF8.GetString(ms.ToArray());
+    }
+}
+
+/// <summary>
+/// Parallel best-effort fan-out to one tenant's clients. Per-send 2 s timeout
+/// so one stale socket never delays delivery to live clients; a client whose
+/// send fails (or times out) is dropped. Per-socket send gating lives in WsClient.
+/// </summary>
+async Task BroadcastAsync(ConcurrentDictionary<Guid, WsClient> clients, string json)
+{
+    var sends = clients.Select(async kv =>
+    {
+        var (id, client) = kv;
         try
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, endOfMessage: true, cts.Token);
+            if (client.Socket.State != WebSocketState.Open)
+            {
+                _ = clients.TryRemove(id, out _);
+                return;
+            }
+            await client.SendTextAsync(json, TimeSpan.FromMilliseconds(SendTimeoutMs));
         }
         catch (Exception)
         {
             _ = clients.TryRemove(id, out _);
-            await CloseQuietlyAsync(ws);
+            await client.CloseAsync();
         }
-    }
+    });
+    await Task.WhenAll(sends);
 }
 
 // --- Overlay channel (no auth): pushes tenant's track, accepts {"cmd":"next"}
 
-async Task ConnectOverlayClientAsync(Tenant t, WebSocket ws)
+async Task ConnectOverlayClientAsync(string id, WebSocket ws)
 {
-    var id = Guid.NewGuid();
-    t.Overlay[id] = ws;
+    var client = new WsClient(ws);
+    var clientId = Guid.NewGuid();
+    TryAttachOverlay(id, clientId, client, out var t);
     try
     {
-        await SendTextAsync(ws, ServedTrackJson(t)); // this tenant's current track on connect (delay applied)
+        // This tenant's current track on connect (throwaway idle when the tenant
+        // has no store entry yet); stream delay applied.
+        if (!await client.TrySendTextAsync(ServedTrackJson(t ?? new Tenant()), TimeSpan.FromMilliseconds(SendTimeoutMs)))
+            return; // dead socket: the finally below completes the close and detaches
+
+        // Pre-creation race (item 24): between the attach above and the connect
+        // send, the tenant's first push may have created the tenant, merged
+        // this client and broadcast — the broadcast can then reach the client
+        // before the idle connect frame, leaving a STALE IDLE as the last
+        // frame. If the tenant exists now, re-send its current track
+        // (snapshotted under tenantLock, so it is the stamped track) — the
+        // last frame is then always the freshest.
+        if (t is null)
+        {
+            string? fresh = null;
+            lock (tenantLock)
+            {
+                if (tenants.TryGetValue(id, out var cur))
+                    fresh = ServedTrackJson(cur);
+            }
+            if (fresh is not null)
+                await client.TrySendTextAsync(fresh, TimeSpan.FromMilliseconds(SendTimeoutMs));
+        }
 
         while (ws.State == WebSocketState.Open)
         {
-            var msg = await ReadFullTextMessageAsync(ws);
+            var msg = await ReadFullTextMessageAsync(client);
             if (msg is null) break;
 
             // {"cmd":"next"} -> relay the skip to THIS tenant's desktop clients; ignore everything else.
@@ -298,7 +402,21 @@ async Task ConnectOverlayClientAsync(Tenant t, WebSocket ws)
                     cmd.ValueKind == JsonValueKind.String &&
                     cmd.GetString() == "next")
                 {
-                    await BroadcastAsync(t.Desktop, NextCmdJson);
+                    // The EBS gate is authoritative (this channel is unauthenticated
+                    // and tenant IDs are guessable): relay only when the stored
+                    // track has skipEnabled, at most once per tenant per second.
+                    var cur = tenants.GetValueOrDefault(id);
+                    if (cur is not null)
+                    {
+                        var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                        bool relay;
+                        lock (cur.Lock)
+                        {
+                            relay = cur.Track.SkipEnabled && nowMs - cur.LastSkipRelayUtcMs >= SkipRelayCooldownMs;
+                            if (relay) cur.LastSkipRelayUtcMs = nowMs;
+                        }
+                        if (relay) await BroadcastAsync(cur.Desktop, NextCmdJson);
+                    }
                 }
             }
             catch (JsonException)
@@ -317,26 +435,28 @@ async Task ConnectOverlayClientAsync(Tenant t, WebSocket ws)
     }
     finally
     {
-        await CompleteCloseHandshakeAsync(ws);
-        _ = t.Overlay.TryRemove(id, out _);
+        await client.CompleteCloseHandshakeAsync();
+        DetachOverlay(id, clientId);
     }
 }
 
 // --- Desktop channel (X-Push-Key): track pushes in, {"type":"next"} out ----
 
-async Task ConnectDesktopClientAsync(Tenant t, WebSocket ws)
+async Task ConnectDesktopClientAsync(string id, WebSocket ws)
 {
-    var id = Guid.NewGuid();
-    t.Desktop[id] = ws;
+    var client = new WsClient(ws);
+    var clientId = Guid.NewGuid();
+    AttachDesktopIfExists(id, clientId, client); // unknown tenant: not registered, nothing to relay yet
     try
     {
-        await SendTextAsync(ws, OkJson);
+        if (!await client.TrySendTextAsync(OkJson, TimeSpan.FromMilliseconds(SendTimeoutMs)))
+            return; // dead socket: nothing left to do
 
         while (ws.State == WebSocketState.Open)
         {
-            var msg = await ReadFullTextMessageAsync(ws);
+            var msg = await ReadFullTextMessageAsync(client);
             if (msg is null) break;
-            await HandleDesktopTrackFrameAsync(t, ws, msg);
+            await HandleDesktopTrackFrameAsync(id, client, clientId, msg);
         }
     }
     catch (WebSocketException)
@@ -349,12 +469,12 @@ async Task ConnectDesktopClientAsync(Tenant t, WebSocket ws)
     }
     finally
     {
-        await CompleteCloseHandshakeAsync(ws);
-        _ = t.Desktop.TryRemove(id, out _);
+        await client.CompleteCloseHandshakeAsync();
+        DetachDesktop(id, clientId);
     }
 }
 
-async Task HandleDesktopTrackFrameAsync(Tenant t, WebSocket ws, string msg)
+async Task HandleDesktopTrackFrameAsync(string id, WsClient client, Guid clientId, string msg)
 {
     JsonElement root;
     try
@@ -364,7 +484,7 @@ async Task HandleDesktopTrackFrameAsync(Tenant t, WebSocket ws, string msg)
     }
     catch (JsonException)
     {
-        await SendTextAsync(ws, BadRequestJson);
+        await client.TrySendTextAsync(BadRequestJson, TimeSpan.FromMilliseconds(SendTimeoutMs));
         return;
     }
 
@@ -373,31 +493,50 @@ async Task HandleDesktopTrackFrameAsync(Tenant t, WebSocket ws, string msg)
         typeEl.ValueKind != JsonValueKind.String ||
         typeEl.GetString() != "track")
     {
-        await SendTextAsync(ws, BadRequestJson);
+        await client.TrySendTextAsync(BadRequestJson, TimeSpan.FromMilliseconds(SendTimeoutMs));
         return;
     }
 
     var track = TrackFromElement(root);
     if (track is null)
     {
-        await SendTextAsync(ws, BadRequestJson);
+        await client.TrySendTextAsync(BadRequestJson, TimeSpan.FromMilliseconds(SendTimeoutMs));
         return;
     }
 
     track.UpdatedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-    lock (t.Lock)
+    // Create-or-get (only pushes create tenants), register this client and
+    // stamp the track atomically so the prune sweep and new connects can't
+    // interleave. No awaits while tenantLock is held.
+    Tenant? t = null;
+    string json = string.Empty;
+    lock (tenantLock)
     {
-        t.Track = track; // stored raw; delay is applied in ServedTrackJson
+        t = CreateOrGetTenantLocked(id);
+        if (t is not null)
+        {
+            t.Desktop[clientId] = client;
+            lock (t.Lock) t.Track = track; // stored raw; delay is applied in ServedTrackJson
+            json = ServedTrackJson(t);
+        }
+    }
+    if (t is null)
+    {
+        // Cap reached after the greeting (a concurrent push took the last
+        // slot): tell the desktop, then close — never a silent drop (item 26).
+        await client.TrySendTextAsync(TenantLimitJson, TimeSpan.FromMilliseconds(SendTimeoutMs));
+        await client.CloseAsync();
+        return;
     }
 
-    await BroadcastAsync(t.Overlay, ServedTrackJson(t));
-    await SendTextAsync(ws, OkJson);
+    await BroadcastAsync(t.Overlay, json);
+    await client.TrySendTextAsync(OkJson, TimeSpan.FromMilliseconds(SendTimeoutMs));
 }
 
 // --- Static files: serve ../overlay/ at the site root ----------------------
 // Resolve relative to the repo root (parent of ebs/); fall back to an
-// overlay/ next to the app (e.g. published layout).
+// overlay/ next to the app (published layout).
 
 var overlayCandidates = new[]
 {
@@ -416,28 +555,32 @@ void ApiHeaders(HttpContext ctx)
 
 bool FixedTimeEquals(string a, string b)
 {
-    var ba = System.Text.Encoding.UTF8.GetBytes(a);
-    var bb = System.Text.Encoding.UTF8.GetBytes(b);
+    var ba = Encoding.UTF8.GetBytes(a);
+    var bb = Encoding.UTF8.GetBytes(b);
     return CryptographicOperations.FixedTimeEquals(ba, bb);
 }
 
 // HEAD included so `curl -I` works against the read endpoint.
+// Read paths never create a tenant: unknown ids serve a throwaway idle track.
 app.MapMethods("/api/track/{tenantId}", new[] { "GET", "HEAD" }, (string tenantId, HttpContext ctx) =>
 {
     ApiHeaders(ctx);
-    if (!ValidTenant(tenantId))
+    var id = tenantId.ToLowerInvariant();
+    if (!ValidTenant(id))
     {
         ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
         return Results.Content(BadTenantJson, "application/json");
     }
     if (ctx.Request.Method == HttpMethods.Head) return Results.Content("", "application/json");
-    return Results.Content(ServedTrackJson(GetTenant(tenantId.ToLowerInvariant())), "application/json");
+    var t = tenants.GetValueOrDefault(id);
+    return Results.Content(ServedTrackJson(t ?? new Tenant()), "application/json");
 });
 
 app.MapGet("/api/track/ws/{tenantId}", async (string tenantId, HttpContext ctx) =>
 {
     ApiHeaders(ctx);
-    if (!ValidTenant(tenantId))
+    var id = tenantId.ToLowerInvariant();
+    if (!ValidTenant(id))
     {
         ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
         await ctx.Response.WriteAsync("invalid tenant id");
@@ -451,13 +594,14 @@ app.MapGet("/api/track/ws/{tenantId}", async (string tenantId, HttpContext ctx) 
     }
 
     using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
-    await ConnectOverlayClientAsync(GetTenant(tenantId.ToLowerInvariant()), ws);
+    await ConnectOverlayClientAsync(id, ws);
 });
 
 app.MapGet("/api/desktop/ws/{tenantId}", async (string tenantId, HttpContext ctx) =>
 {
     ApiHeaders(ctx);
-    if (!ValidTenant(tenantId))
+    var id = tenantId.ToLowerInvariant();
+    if (!ValidTenant(id))
     {
         ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
         await ctx.Response.WriteAsync("invalid tenant id");
@@ -480,8 +624,22 @@ app.MapGet("/api/desktop/ws/{tenantId}", async (string tenantId, HttpContext ctx
         return;
     }
 
+    // Tenant cap: a NEW tenant at Ebs:MaxTenants is rejected before the WS
+    // handshake; existing tenants are unaffected.
+    bool atTenantCap = false;
+    lock (tenantLock)
+    {
+        atTenantCap = !tenants.ContainsKey(id) && tenants.Count >= maxTenants;
+    }
+    if (atTenantCap)
+    {
+        ctx.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        await ctx.Response.WriteAsync("tenant limit reached");
+        return;
+    }
+
     using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
-    await ConnectDesktopClientAsync(GetTenant(tenantId.ToLowerInvariant()), ws);
+    await ConnectDesktopClientAsync(id, ws);
 });
 
 app.MapGet("/health", (HttpContext ctx) =>
@@ -490,24 +648,46 @@ app.MapGet("/health", (HttpContext ctx) =>
     return Results.Text("ok");
 });
 
-// --- Tenant pruning: drop tenants with no open WS connection and an idle ---
-// --- stored track (a fresh tenant can always be recreated on demand). -------
+// --- Tenant pruning: drop tenants with no open WS connection whose stored
+// --- track is idle OR older than Ebs:PruneStaleAfterMs — a disconnected
+// --- desktop never re-pushes idle, so dead playing/paused tenants must be
+// --- freed by age too, or at Ebs:MaxTenants the store wedges with 429 for
+// --- every new streamer. The sweep holds tenantLock (serialization with
+// --- attach and creation, so it can't orphan a connecting client) and must
+// --- not fault on shutdown (OperationCanceledException caught). -----------
 
 var pruneCts = CancellationTokenSource.CreateLinkedTokenSource(app.Lifetime.ApplicationStopping);
 _ = Task.Run(async () =>
 {
     using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(Math.Max(1000, pruneIntervalMs)));
-    while (await timer.WaitForNextTickAsync(pruneCts.Token))
+    try
     {
-        foreach (var (id, t) in tenants)
+        while (await timer.WaitForNextTickAsync(pruneCts.Token))
         {
-            bool idle;
-            lock (t.Lock) idle = t.Track.State == TrackState.Idle;
-            if (idle && t.Overlay.IsEmpty && t.Desktop.IsEmpty)
-                tenants.TryRemove(id, out _);
+            var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            lock (tenantLock)
+            {
+                foreach (var (id, t) in tenants)
+                {
+                    if (!t.Overlay.IsEmpty || !t.Desktop.IsEmpty) continue;
+                    bool prune;
+                    lock (t.Lock)
+                        prune = t.Track.State == TrackState.Idle ||
+                                nowMs - t.Track.UpdatedAt > pruneStaleAfterMs;
+                    if (prune) tenants.TryRemove(id, out _);
+                }
+            }
         }
     }
-}, CancellationToken.None);
+    catch (OperationCanceledException)
+    {
+        // shutdown: expected
+    }
+    finally
+    {
+        pruneCts.Dispose();
+    }
+});
 
 // --- Static serving (after API routing so /api/* and /health win) ----------
 
@@ -532,14 +712,107 @@ app.Run();
 // Local types must follow all top-level statements in a top-level program.
 
 /// <summary>
+/// A client socket plus its per-socket send gate. The gate guarantees at most
+/// one outstanding send per socket (the WebSocket API forbids two concurrent
+/// sends — and a CloseOutputAsync racing an in-flight SendAsync); a "busy"
+/// send simply waits on the gate. Only a real send failure drops the client
+/// (the caller catches and removes it).
+/// </summary>
+sealed class WsClient
+{
+    private readonly SemaphoreSlim _sendGate = new(1, 1);
+
+    public WsClient(WebSocket socket) => Socket = socket;
+
+    public WebSocket Socket { get; }
+
+    public async Task SendTextAsync(string json, TimeSpan timeout)
+    {
+        var bytes = Encoding.UTF8.GetBytes(json);
+        await _sendGate.WaitAsync();
+        try
+        {
+            using var cts = new CancellationTokenSource(timeout);
+            await Socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, endOfMessage: true, cts.Token);
+        }
+        finally
+        {
+            _sendGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Non-throwing send for the direct (non-broadcast) paths: a 2 s send
+    /// timeout (OperationCanceledException), a reset or a socket-state
+    /// failure returns false instead of escaping as an unhandled request
+    /// error. Gate-safe: the gate is released on every path.
+    /// </summary>
+    public async Task<bool> TrySendTextAsync(string json, TimeSpan timeout)
+    {
+        try
+        {
+            await SendTextAsync(json, timeout);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false; // caller treats it as a dead send
+        }
+    }
+
+    /// <summary>
+    /// Close serialized with SendTextAsync through the same gate (a
+    /// CloseOutputAsync racing an in-flight SendAsync is exactly the
+    /// InvalidOperationException the gate exists for), best effort.
+    /// </summary>
+    public async Task CloseAsync(string reason = "send failed")
+    {
+        await _sendGate.WaitAsync();
+        try
+        {
+            if (Socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
+                await Socket.CloseOutputAsync(WebSocketCloseStatus.EndpointUnavailable, reason, default);
+        }
+        catch
+        {
+            // best effort
+        }
+        finally
+        {
+            _sendGate.Release();
+        }
+    }
+
+    /// <summary>Answer the peer's close frame (if any), through the gate.</summary>
+    public async Task CompleteCloseHandshakeAsync()
+    {
+        await _sendGate.WaitAsync();
+        try
+        {
+            if (Socket.State == WebSocketState.CloseReceived)
+                await Socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, string.Empty, default);
+        }
+        catch
+        {
+            // best effort
+        }
+        finally
+        {
+            _sendGate.Release();
+        }
+    }
+}
+
+/// <summary>
 /// Per-tenant state: track store (guarded by Lock), overlay-channel clients,
-/// desktop-channel clients. positionMs is stored RAW; the stream delay is
-/// applied in ServedTrackJson.
+/// desktop-channel clients, skip-relay cooldown. positionMs is stored RAW;
+/// the stream delay is applied in ServedTrackJson.
 /// </summary>
 sealed class Tenant
 {
     public readonly object Lock = new();
     public Track Track = new();
-    public readonly ConcurrentDictionary<Guid, WebSocket> Overlay = new(); // GET /api/track/ws/{id}
-    public readonly ConcurrentDictionary<Guid, WebSocket> Desktop = new(); // GET /api/desktop/ws/{id}
+    public readonly ConcurrentDictionary<Guid, WsClient> Overlay = new(); // GET /api/track/ws/{id}
+    public readonly ConcurrentDictionary<Guid, WsClient> Desktop = new(); // GET /api/desktop/ws/{id}
+    public long LastSkipRelayUtcMs;                                       // skip-relay cooldown (per tenant)
 }

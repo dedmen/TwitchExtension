@@ -40,6 +40,10 @@
   let lastKey = null; // "title \u0000 artist" of the currently shown track
   let tileVisible = false;
   let currentState = "idle"; // drives progress-bar advance/hold
+  // Skip lock: after a skip click the button stays disabled (dimmed) until
+  // the track actually changes.
+  let skipLockKey = null; // pre-click "title \u0000 artist" while locked
+  let prevSkipEnabled = null; // last message's skipEnabled (false->true flip re-enables)
   // Progress anchor: re-set on EVERY track message (the EBS already applied
   // the stream delay to positionMs — no delay math here).
   let anchorPos = 0;
@@ -57,12 +61,26 @@
   }
 
   // --- Rendering ---
+  // The last art URL whose image failed to load: a later message with the
+  // SAME url must keep the placeholder (assigning an identical src fires no
+  // load — the <img> would sit empty). A different src loads normally.
+  let failedArtSrc = null;
   function setArt(art) {
     if (typeof art === "string" && art.length > 0) {
+      if (art === failedArtSrc) {
+        artImg.hidden = true;
+        artPlaceholder.hidden = false;
+        return;
+      }
       artPlaceholder.hidden = true;
       if (artImg.hidden || artImg.getAttribute("src") !== art) {
         artImg.onerror = function () {
-          // Unloadable art URL: fall back to the music-note placeholder.
+          // `art` (closure) is the URL THIS load belongs to. A slow load can
+          // fail after we already moved on to a newer art URL — then the
+          // error is stale: it must not touch the current image, and the
+          // failed-URL set must record `art`, not the live attribute.
+          if (artImg.getAttribute("src") !== art) return;
+          failedArtSrc = art;
           artImg.hidden = true;
           artPlaceholder.hidden = false;
         };
@@ -79,6 +97,7 @@
     const title = typeof track.title === "string" ? track.title : "";
     const artist = typeof track.artist === "string" ? track.artist : "";
     currentState = typeof track.state === "string" ? track.state : "idle";
+    const key = title + "\u0000" + artist;
 
     // --- Progress anchor: every track message re-anchors (reset on new track). ---
     anchorPos = Math.max(0, Number(track.positionMs) || 0);
@@ -101,8 +120,18 @@
       nextLineEl.hidden = true;
     }
 
-    // --- Skip button: only when the desktop's tray toggle allows it. ---
-    skipBtn.hidden = track.skipEnabled !== true;
+    // --- Skip button: only when skipEnabled. A locked button (post-skip)
+    // re-enables once the track actually changes (a different title+artist)
+    // or when skipEnabled flips back to true after being false. ---
+    const skipEnabledNow = track.skipEnabled === true;
+    if (skipLockKey !== null && currentState !== "idle" && title !== "") {
+      if (key !== skipLockKey || (skipEnabledNow && prevSkipEnabled === false)) {
+        skipLockKey = null;
+        skipBtn.disabled = false;
+      }
+    }
+    prevSkipEnabled = skipEnabledNow;
+    skipBtn.hidden = !skipEnabledNow;
 
     // No track to show: hide the tile entirely.
     if (currentState === "idle" || title === "") {
@@ -134,7 +163,6 @@
     tile.classList.toggle("paused", currentState === "paused");
 
     // Track change (title + artist): retrigger the ~300 ms fade/slide-in.
-    const key = title + "\u0000" + artist;
     if (key !== lastKey) {
       lastKey = key;
       tile.classList.remove("anim-in");
@@ -251,6 +279,11 @@
     if (socket && socket.readyState === WebSocket.OPEN) {
       try {
         socket.send('{"cmd":"next"}');
+        // Skip lock: keep the button disabled (dimmed) until the track
+        // actually changes — render() releases it on a different key or a
+        // skipEnabled false->true flip.
+        skipLockKey = lastKey;
+        skipBtn.disabled = true;
       } catch (err) {
         // fire-and-forget; a failed send dies with the socket's close handler
       }
@@ -317,9 +350,12 @@
     let drag = null; // {id, startX, startY, rect, moved}
 
     tile.addEventListener("pointerdown", function (e) {
+      // A new gesture starts: clear any stale suppression flag BEFORE any
+      // early return — otherwise a drag that ended over the button would
+      // eat the next real click (S9).
+      suppressClick = false;
       if (!e.isPrimary || e.button !== 0) return;
       if (e.target.closest && e.target.closest(".skip-btn")) return; // not a drag target
-      suppressClick = false; // a new gesture starts; the old flag is stale
       drag = {
         id: e.pointerId,
         startX: e.clientX,

@@ -17,11 +17,25 @@ tenants.
   (case-insensitive). Invalid format → `400`. A path without the segment
   (e.g. `GET /api/track`) → `404`.
 - An unknown tenant is not an error: the overlay channel serves the idle
-  track, and a desktop channel's first push creates the tenant.
+  track, and a desktop channel connects normally — its first **accepted
+  push** creates the tenant.
+- Tenants are **created only by an accepted desktop-channel push**. The read
+  paths (`GET /api/track/{id}`, overlay WS) never create one — they serve the
+  idle track from a throwaway object. Overlay clients that connect to a not-yet
+  known tenant are merged into the tenant when its first push arrives.
+- The store is bounded by `Ebs:MaxTenants` (default `1000`): once the cap is
+  reached, a desktop-channel upgrade for a *new* tenantId is rejected with
+  `429` before the WS handshake (existing tenants are unaffected). A desktop
+  that already got its greeting and only then hits the cap on its first push
+  is not dropped silently — it receives `{"error":"tenant-limit"}` before the
+  close.
 - The push key is one **global** secret (`Ebs:PushKey`): it authorizes a
   desktop channel for *any* tenantId.
-- Tenants with no open WebSocket connection and an idle stored track are
-  pruned by a background timer (every `Ebs:PruneIntervalMs`, default 10 min).
+- Tenants with no open WebSocket connection are pruned by a background timer
+  (every `Ebs:PruneIntervalMs`, default 10 min) when their stored track is
+  `idle` **or** older than `Ebs:PruneStaleAfterMs` (default `3600000`, 1 h) —
+  a disconnected desktop never re-pushes `idle`, so dead `playing`/`paused`
+  tenants must be freed by age too, or the store wedges at the cap.
 
 ## Endpoints
 
@@ -37,7 +51,24 @@ There is no HTTP write endpoint — tracks are pushed as frames on the desktop
 channel: `{"type":"track", ...Track fields}` → ack `{"ok":true}` (or
 `{"error":"bad-request"}`, connection stays open). The overlay's skip button
 sends `{"cmd":"next"}` on the overlay channel; the EBS relays `{"type":"next"}`
-to that tenant's connected desktop clients only.
+to that tenant's connected desktop clients only — **only when the tenant's
+stored track has `skipEnabled: true`**, with a 1 s per-tenant cooldown
+(the overlay channel is unauthenticated and tenant IDs are guessable, so the
+EBS gate is authoritative — the overlay's hidden/disabled button is a UI gate
+only).
+
+Inbound limits: one inbound text message per client is capped at **2 MB**
+(exceeding it closes that connection); a track frame with an `art` string
+longer than **700 KB**, or a negative `positionMs`/`durationMs`/timeline
+value, is `bad-request`.
+
+Send path: a client socket never has two outstanding sends (per-client send
+gate); fan-out to one tenant's overlay clients runs in parallel with a 2 s
+per-send timeout, so one stale socket never delays live clients. Keep-alive:
+the server sends a WebSocket **PING** every `Ebs:KeepAliveSeconds` (default
+`60` s; `WebSocketOptions.KeepAliveInterval`) and aborts a client that does
+not PONG within the same window (`KeepAliveTimeout`) — a client must keep a
+read pending to auto-pong, which is what detects half-open sockets.
 
 ## Position at serve time
 
@@ -69,7 +100,7 @@ dotnet run --project ebs --urls http://127.0.0.1:5080
 Settings live in `appsettings.json`:
 
 ```json
-{ "Ebs": { "PushKey": "dev-push-key-change-me", "StreamDelayMs": 10000, "PruneIntervalMs": 600000 } }
+{ "Ebs": { "PushKey": "dev-push-key-change-me", "StreamDelayMs": 10000, "PruneIntervalMs": 600000, "PruneStaleAfterMs": 3600000, "MaxTenants": 1000, "KeepAliveSeconds": 60 } }
 ```
 
 - **`Ebs:PushKey`** — auth for the desktop channel (`X-Push-Key` header on the
@@ -77,13 +108,24 @@ Settings live in `appsettings.json`:
   (keep it out of git) or the `Ebs__PushKey` environment variable
   (double underscore = config section divider).
 - **`Ebs:StreamDelayMs`** — viewers hear the stream ~this many ms behind the
-  player. The EBS stores `positionMs` raw and serves
-  `max(0, positionMs - StreamDelayMs)` in every output (GET + overlay channel),
-  so the overlay's progress bar lags the player by exactly the stream delay.
-  Default `10000`.
+  player. The EBS stores `positionMs` raw and applies the delay in every
+  output (GET + overlay channel): the serve-time formula (above) when the
+  timeline baseline is known, the legacy `max(0, positionMs - StreamDelayMs)`
+  when it is not — so the overlay's progress bar lags the player by about the
+  stream delay. Default `10000`.
 - **`Ebs:PruneIntervalMs`** — how often the background timer prunes tenants
-  that have no open WebSocket connection and an idle stored track.
-  Default `600000` (10 min).
+  that have no open WebSocket connection and whose stored track is `idle` or
+  older than `Ebs:PruneStaleAfterMs`. Default `600000` (10 min).
+- **`Ebs:PruneStaleAfterMs`** — age threshold for pruning connection-less
+  tenants: a `playing`/`paused` track older than this is pruned even though a
+  disconnected desktop never re-pushed `idle` (without it, the store wedges
+  at `Ebs:MaxTenants`). Default `3600000` (1 h).
+- **`Ebs:MaxTenants`** — cap on the tenant store. When the cap is reached, a
+  desktop-channel upgrade for a *new* tenantId gets `429` before the WS
+  handshake; existing tenants are unaffected. Default `1000`.
+- **`Ebs:KeepAliveSeconds`** — WebSocket keep-alive: sets `KeepAliveInterval`
+  (PING cadence) and `KeepAliveTimeout` (abort when no PONG arrives).
+  Default `60`; shorten only for testing.
 
 ## Production: nginx reverse proxy (HTTPS + WebSocket)
 
@@ -91,8 +133,15 @@ Publish the app to the server and run it, e.g.:
 
 ```bash
 dotnet publish ebs -c Release -o /opt/ebs
+# the app serves the overlay from <publish dir>/overlay (its fallback path,
+# used when ../overlay next to the source tree is absent) — copy it there:
+cp -r <repo>/overlay /opt/ebs/overlay
 dotnet /opt/ebs/TwitchExtension.Ebs.dll --urls http://127.0.0.1:5080
 ```
+
+Verify with the startup log: `Serving overlay from /opt/ebs/overlay`. Without
+the copy, `/` would 404 in production (the repo-relative `../overlay` does
+not exist on the server).
 
 Then front it with nginx. Both WebSocket paths need HTTP/1.1 +
 `Upgrade`/`Connection` header forwarding and long idle timeouts; everything

@@ -18,7 +18,6 @@
   var saveBtn = document.getElementById("save");
   var plainNote = document.getElementById("plainNote");
   var statusEl = document.getElementById("status");
-  var ready = false;
 
   // Guarded: outside Twitch window.Twitch may not exist at all.
   function twitchExt() {
@@ -79,7 +78,6 @@
   function pollReady(retries) {
     var c = configApi();
     if (c) {
-      ready = true;
       plainNote.hidden = true;
       statusEl.textContent = "Twitch extension context: ready.";
       prefill(c);
@@ -109,7 +107,6 @@
       statusEl.textContent = "Not ready yet — " + extState();
       return;
     }
-    saveBtn.disabled = true;
     savedEl.textContent = "Saving…";
     savedEl.hidden = false;
     try {
@@ -121,7 +118,6 @@
       savedEl.hidden = true;
       showError("Save failed: " + (err && err.message ? err.message : err));
     }
-    saveBtn.disabled = false;
   });
 
   pollReady(12); // 12 × 400 ms ≈ 5 s

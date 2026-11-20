@@ -58,7 +58,6 @@ public sealed class SmtcMonitor : IDisposable
     private readonly TypedEventHandler<GlobalSystemMediaTransportControlsSession, MediaPropertiesChangedEventArgs> _mediaPropertiesChanged;
     private readonly TypedEventHandler<GlobalSystemMediaTransportControlsSession, PlaybackInfoChangedEventArgs> _playbackInfoChanged;
 
-    private GlobalSystemMediaTransportControlsSession? _session;
     private readonly List<GlobalSystemMediaTransportControlsSession> _watched = new();
     private volatile bool _disposed;
 
@@ -123,9 +122,35 @@ public sealed class SmtcMonitor : IDisposable
     public void Dispose()
     {
         _disposed = true;
-        UnsubscribeAll();
-        _manager.SessionsChanged -= _sessionsChanged;
-        _manager.CurrentSessionChanged -= _currentSessionChanged;
+        // Unsubscribe the per-session handlers under _gate: a fire-and-forget
+        // ResubscribeCoreAsync may be mutating _watched concurrently, and iterating
+        // a list mid-mutation throws — the Exit path must never throw (plan.md).
+        // Bounded wait so shutdown cannot hang behind a slow SMTC read.
+        bool gotGate = false;
+        try
+        {
+            gotGate = _gate.Wait(TimeSpan.FromSeconds(2));
+            if (gotGate)
+            {
+                UnsubscribeAll();
+            }
+        }
+        finally
+        {
+            if (gotGate)
+            {
+                _gate.Release();
+            }
+        }
+        try
+        {
+            _manager.SessionsChanged -= _sessionsChanged;
+            _manager.CurrentSessionChanged -= _currentSessionChanged;
+        }
+        catch
+        {
+            // manager already gone: nothing left to unsubscribe
+        }
     }
 
     private void OnSessionsChanged(GlobalSystemMediaTransportControlsSessionManager sender, SessionsChangedEventArgs args)
@@ -161,35 +186,46 @@ public sealed class SmtcMonitor : IDisposable
     /// event fires (the list and the current session are unchanged), so the monitor must be
     /// listening on every session to re-select. A session object is never cached across a
     /// list change.
+    ///
+    /// Guarded end-to-end (plan.md "every SMTC read is guarded"): a dying session throwing
+    /// during re-resolve keeps the last state and is logged — this runs in fire-and-forget
+    /// tasks, and a faulted task would silently stop raising/re-subscribing (frozen app).
     /// </summary>
     private async Task ResubscribeCoreAsync()
     {
-        UnsubscribeAll();
-
-        var sessions = _manager.GetSessions().ToList();
-        foreach (var s in sessions)
+        if (_disposed) return; // shutdown won the race: no more re-subscribes
+        try
         {
-            try
-            {
-                s.MediaPropertiesChanged += _mediaPropertiesChanged;
-                s.PlaybackInfoChanged += _playbackInfoChanged;
-                _watched.Add(s);
-            }
-            catch
-            {
-                // session dying mid-subscribe: skip it
-            }
-        }
+            UnsubscribeAll();
 
-        var session = await SelectSessionAsync(sessions);
-        if (_disposed || session is null)
+            var sessions = _manager.GetSessions().ToList();
+            foreach (var s in sessions)
+            {
+                try
+                {
+                    s.MediaPropertiesChanged += _mediaPropertiesChanged;
+                    s.PlaybackInfoChanged += _playbackInfoChanged;
+                    _watched.Add(s);
+                }
+                catch
+                {
+                    // session dying mid-subscribe: skip it
+                }
+            }
+
+            var session = await SelectSessionAsync(sessions);
+            if (_disposed || session is null)
+            {
+                Raise(Track.Idle);
+                return;
+            }
+
+            await RefreshCoreAsync(session);
+        }
+        catch (Exception ex)
         {
-            Raise(Track.Idle);
-            return;
+            AppLog.Write($"[smtc] re-resolve failed: {ex.GetBaseException().Message}");
         }
-
-        _session = session;
-        await RefreshCoreAsync(session);
     }
 
     /// <summary>
@@ -222,7 +258,17 @@ public sealed class SmtcMonitor : IDisposable
 
                 // Only an active track (playing/paused) wins; a stopped/none preferred
                 // session has been abandoned and must not hide the current session.
-                var status = candidate.GetPlaybackInfo().PlaybackStatus;
+                // Guarded per candidate (plan.md "every SMTC read is guarded"): a dying
+                // session throwing is skipped, not fatal to the selection.
+                GlobalSystemMediaTransportControlsSessionPlaybackStatus status;
+                try
+                {
+                    status = candidate.GetPlaybackInfo().PlaybackStatus;
+                }
+                catch
+                {
+                    continue;
+                }
                 if (status != GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing &&
                     status != GlobalSystemMediaTransportControlsSessionPlaybackStatus.Paused)
                     continue;
@@ -301,18 +347,20 @@ public sealed class SmtcMonitor : IDisposable
             // projection exposes the anchor via the session timeline (not via
             // PlaybackInfo.Position / MediaProperties.PlaybackDuration): relative to
             // StartTime, so a typical track (StartTime 0) gives the raw position.
+            // Every value is clamped before the double→int cast (plan.md): a bogus
+            // EndTime/TimeSpan.MaxValue would convert to a negative int, which the EBS
+            // rejects as bad-request and would stop all updates.
             int positionMs = 0, durationMs = 0;
             try
             {
                 var timeline = session.GetTimelineProperties();
-                positionMs = (int)Math.Max(0, (timeline.Position - timeline.StartTime).TotalMilliseconds);
-                durationMs = (timeline.EndTime - timeline.StartTime).TotalMilliseconds > 0
-                    ? (int)(timeline.EndTime - timeline.StartTime).TotalMilliseconds
-                    : 0; // 0 = unknown
+                positionMs = ClampMs((timeline.Position - timeline.StartTime).TotalMilliseconds);
+                var durationMsValue = (timeline.EndTime - timeline.StartTime).TotalMilliseconds;
+                durationMs = durationMsValue > 0 ? ClampMs(durationMsValue) : 0; // 0 = unknown
             }
             catch
             {
-                // timeline unavailable on this session: anchor unknown (0)
+                // timeline unavailable (or overflowing) on this session: anchor unknown (0)
             }
 
             var title = Clean(properties?.Title);
@@ -343,20 +391,26 @@ public sealed class SmtcMonitor : IDisposable
                 _pausedForMs,
                 _pausedSinceUtcMs));
         }
-        catch
+        catch (Exception ex)
         {
-            // The session may be dying mid-read; its list removal (or the next event)
-            // triggers a full re-subscribe. Just report idle for now.
-            Raise(Track.Idle);
+            // A dying session throwing mid-read is normal (plan.md "every SMTC read is
+            // guarded"): keep the last state and log. A spurious idle here would blink
+            // the tile; if the session is really gone, its list removal re-subscribes.
+            AppLog.Write($"[smtc] refresh failed: {ex.GetBaseException().Message}");
         }
     }
 
+    /// <summary>Clamps a (possibly bogus/negative/huge) millisecond value to a safe int ≥ 0.</summary>
+    private static int ClampMs(double ms) => (int)Math.Max(0, Math.Min(int.MaxValue, ms));
+
     /// <summary>
     /// Maintains the timeline baseline for the current track (plan.md "Timeline fields"):
-    /// re-baseline on a new track (title/artist change or a backwards position reset),
-    /// pause/resume accounting on state transitions, and seek self-healing when the
-    /// sampled position deviates from the baseline's expectation by more than 10 s.
-    /// Caller holds <c>_gate</c>.
+    /// re-baseline on a new track (title/artist change, or a backwards position reset
+    /// while playing); <c>stopped</c> with content counts as a pause (Sendspin reports
+    /// pause as <c>stopped</c>); clear-on-resume is unconditional on the previous state;
+    /// seek self-healing when the sampled position deviates from the baseline's
+    /// expectation by more than 10 s. Only a true track end (no content / no session →
+    /// idle) resets the timeline. Caller holds <c>_gate</c>.
     /// </summary>
     private void UpdateTimelineBaseline(long nowUtc, string state, string title, string artist,
         int positionMs, int durationMs)
@@ -364,11 +418,16 @@ public sealed class SmtcMonitor : IDisposable
         var last = _lastTrack;
         var isPlaying = state == Track.StatePlaying;
         var isPaused = state == Track.StatePaused;
+        var isInactive = isPaused || state == Track.StateStopped; // paused, or Sendspin's stopped-as-pause
 
         var isNewTrack = last is null
                           || last.Title != title
                           || last.Artist != artist
-                          || (last.PositionMs > 0 && positionMs < last.PositionMs - SeekToleranceMs);
+                          // A backwards position reset counts as a new track only while
+                          // playing (a seek/restart). A paused/stopped frame may report a
+                          // reset position (the player stopped) without any track change —
+                          // re-baselining there would lose the pause point on resume.
+                          || (isPlaying && last!.PositionMs > 0 && positionMs < last.PositionMs - SeekToleranceMs);
 
         if (isNewTrack)
         {
@@ -378,16 +437,23 @@ public sealed class SmtcMonitor : IDisposable
             // with unknown duration); seek self-healing re-baselines on any drift.
             _startedAtUtcMs = nowUtc - positionMs;
             _pausedForMs = 0;
-            _pausedSinceUtcMs = isPaused ? nowUtc : 0;
+            _pausedSinceUtcMs = isInactive ? nowUtc : 0;
         }
-        else if (isPaused && last!.State != Track.StatePaused)
+        else if (isInactive && last!.State != Track.StatePaused && last!.State != Track.StateStopped)
         {
-            // transition into pause: start the pause clock
+            // Transition into pause — or, for a source that maps pause to stopped
+            // (Sendspin, which keeps title/artist), into "stopped" with content
+            // (plan.md "stopped with content = pause"): start the pause clock, keep the
+            // baseline. paused↔stopped hops do not restart the clock.
             _pausedSinceUtcMs = nowUtc;
         }
-        else if (isPlaying && last!.State == Track.StatePaused && _pausedSinceUtcMs > 0)
+
+        // Unconditional clear-on-resume (plan.md): playing with an open pause clock
+        // accumulates and clears it — regardless of whether the previous state was
+        // paused or stopped. A stale pausedSinceUtcMs would make the EBS serve a frozen
+        // bar on a playing track.
+        if (isPlaying && _pausedSinceUtcMs > 0)
         {
-            // resume: accumulate the paused span
             _pausedForMs += nowUtc - _pausedSinceUtcMs;
             _pausedSinceUtcMs = 0;
         }
@@ -417,7 +483,6 @@ public sealed class SmtcMonitor : IDisposable
             s.PlaybackInfoChanged -= _playbackInfoChanged;
         }
         _watched.Clear();
-        _session = null;
     }
 
     private void Raise(Track track)
